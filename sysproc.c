@@ -21,9 +21,43 @@ sys_exit(void)
 }
 
 int
+sys_exitS(void)
+{
+   int status;
+   if(argint(0,&status) < 0)
+     return -1;
+   exitS(status);
+   return 0;
+}
+
+int
 sys_wait(void)
 {
   return wait();
+}
+
+int
+sys_waitS(void)
+{
+  int *ptr;
+  if(argptr(0,(char**)&ptr, sizeof(int*)) < 0)
+    return -1;
+  return waitS(ptr);
+}
+
+int
+sys_waitPID(void)
+{
+  int pid;
+  if(argint(0,&pid) < 0)
+    return -1;
+  int *status;
+  if(argptr(1,(char**)&status, sizeof(int*)) < 0)
+    return -1;
+  int options;
+  if(argint(0,&options) < 0)
+    return -1;
+  return waitPID(pid, status, options);
 }
 
 int

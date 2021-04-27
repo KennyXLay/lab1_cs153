@@ -121,6 +121,9 @@ int             wait(void);
 void            wakeup(void*);
 void            yield(void);
 
+int		exitS(int);
+int		waitS(int*);
+int		waitPID(int, int*, int);
 // swtch.S
 void            swtch(struct context**, struct context*);
 
