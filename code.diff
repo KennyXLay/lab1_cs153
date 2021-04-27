@@ -1,0 +1,357 @@
+diff --git a/Makefile b/Makefile
+index 09d790c..a8df47e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -181,6 +181,7 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_test\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/defs.h b/defs.h
+index 82fb982..89d2e65 100644
+--- a/defs.h
++++ b/defs.h
+@@ -121,6 +121,9 @@ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
+ 
++int		exitS(int);
++int		waitS(int*);
++int		waitPID(int, int*, int);
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+ 
+diff --git a/proc.c b/proc.c
+index 806b1b1..6affcf9 100644
+--- a/proc.c
++++ b/proc.c
+@@ -267,6 +267,52 @@ exit(void)
+   panic("zombie exit");
+ }
+ 
++int
++exitS(int exitStatus)
++{
++  struct proc *curproc = myproc();
++  struct proc *p;
++  int fd;
++  
++  curproc->exitStatus = exitStatus;
++  
++  if(curproc == initproc)
++    panic("init exiting");
++
++  // Close all open files.
++  for(fd = 0; fd < NOFILE; fd++){
++    if(curproc->ofile[fd]){
++      fileclose(curproc->ofile[fd]);
++      curproc->ofile[fd] = 0;
++    }
++  }
++
++  begin_op();
++  iput(curproc->cwd);
++  end_op();
++  curproc->cwd = 0;
++
++  acquire(&ptable.lock);
++
++  // Parent might be sleeping in wait().
++  wakeup1(curproc->parent);
++
++  // Pass abandoned children to init.
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    if(p->parent == curproc){
++      p->parent = initproc;
++      if(p->state == ZOMBIE)
++        wakeup1(initproc);
++    }
++  }
++
++  // Jump into the scheduler, never to return.
++  curproc->state = ZOMBIE;
++  sched();
++  panic("zombie exit");
++}
++
++
+ // Wait for a child process to exit and return its pid.
+ // Return -1 if this process has no children.
+ int
+@@ -311,6 +357,96 @@ wait(void)
+   }
+ }
+ 
++int
++waitS(int* status)
++{
++  struct proc *p;
++  int havekids, pid;
++  struct proc *curproc = myproc();
++  
++  acquire(&ptable.lock);
++  for(;;){
++    // Scan through table looking for exited children.
++    havekids = 0;
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      if(p->parent != curproc)
++        continue;
++      havekids = 1;
++      if(p->state == ZOMBIE){
++        // Found one.
++        *status = p->exitStatus;
++        pid = p->pid;
++        kfree(p->kstack);
++        p->kstack = 0;
++        freevm(p->pgdir);
++        p->pid = 0;
++        p->parent = 0;
++        p->name[0] = 0;
++        p->killed = 0;
++        p->state = UNUSED;
++        release(&ptable.lock);
++        return pid;
++      }
++    }
++
++    // No point waiting if we don't have any children.
++    if(!havekids || curproc->killed){
++      release(&ptable.lock);
++      return -1;
++    }
++
++    // Wait for children to exit.  (See wakeup1 call in proc_exit.)
++    sleep(curproc, &ptable.lock);  //DOC: wait-sleep
++  }
++}
++
++int
++waitPID(int pid, int* status, int options)
++{
++  struct proc *p;
++  //int havekids, pid;
++  struct proc *curproc = myproc();
++  
++  acquire(&ptable.lock);
++  for(;;){
++    // Scan through table looking for exited children.
++    //havekids = 0;
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      //if(p->parent != curproc)
++        //continue;
++      //havekids = 1;
++     if(p->pid == pid){ 
++        if(p->state == ZOMBIE){
++          // Found one.
++          pid = p->pid;
++          kfree(p->kstack);
++          p->kstack = 0;
++          freevm(p->pgdir);
++          p->pid = 0;
++          p->parent = 0;
++          p->name[0] = 0;
++          p->killed = 0;
++          p->state = UNUSED;
++       	  *status = p->exitStatus;
++          release(&ptable.lock);
++          return pid;
++        }
++     } 
++    }
++
++    // No point waiting if we don't have any children.
++    if(curproc->killed){
++      release(&ptable.lock);
++      return -1;
++    }
++
++    // Wait for children to exit.  (See wakeup1 call in proc_exit.)
++    sleep(curproc, &ptable.lock);  //DOC: wait-sleep
++  }
++}
++
++
++
+ //PAGEBREAK: 42
+ // Per-CPU process scheduler.
+ // Each CPU calls scheduler() after setting itself up.
+diff --git a/proc.h b/proc.h
+index 1647114..de139fe 100644
+--- a/proc.h
++++ b/proc.h
+@@ -49,6 +49,7 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int exitStatus;	       // Exitstatus parameter 0-> normal quit. 1/2/
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff --git a/syscall.c b/syscall.c
+index ee85261..953651a 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -103,6 +103,9 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_exitS(void);
++extern int sys_waitS(void);
++extern int sys_waitPID(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +129,9 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_exitS]   sys_exitS,
++[SYS_waitS]   sys_waitS,
++[SYS_waitPID] sys_waitPID
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..01566e3 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,6 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_exitS  22
++#define SYS_waitS  23
++#define SYS_waitPID  24
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..cd9d452 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -21,12 +21,46 @@ sys_exit(void)
+ }
+ 
+ int
++sys_exitS(void)
++{
++   int status;
++   if(argint(0,&status) < 0)
++     return -1;
++   exitS(status);
++   return 0;
++}
++
++int
+ sys_wait(void)
+ {
+   return wait();
+ }
+ 
+ int
++sys_waitS(void)
++{
++  int *ptr;
++  if(argptr(0,(char**)&ptr, sizeof(int*)) < 0)
++    return -1;
++  return waitS(ptr);
++}
++
++int
++sys_waitPID(void)
++{
++  int pid;
++  if(argint(0,&pid) < 0)
++    return -1;
++  int *status;
++  if(argptr(1,(char**)&status, sizeof(int*)) < 0)
++    return -1;
++  int options;
++  if(argint(0,&options) < 0)
++    return -1;
++  return waitPID(pid, status, options);
++}
++
++int
+ sys_kill(void)
+ {
+   int pid;
+diff --git a/test.c b/test.c
+new file mode 100644
+index 0000000..a969632
+--- /dev/null
++++ b/test.c
+@@ -0,0 +1,48 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++
++
++int main(int argc, char *argv[]) {
++	int waitpid(void);
++
++	waitpid();
++
++	exitS(0);
++	return 0;
++}
++
++
++int waitpid(void){
++
++	int ret_pid, exit_status;
++	int pid_a[3] = {0, 0, 0};
++	int i = 0;
++
++	printf(1, "Testing waitpid\n");
++	
++	for(i = 0; i < 3; i++){
++		pid_a[i] = fork();
++		if(pid_a[i] == 0){
++			printf(1, "\n This is child with PID# %d and I will exit with status %d\n", getpid(), getpid() + 2);
++		exitS(getpid() + 2);
++		}
++	}
++	sleep(3);
++	printf(1, "\n This is the parent: Waiting for child with PID# %d\n",pid_a[1]);
++        ret_pid = waitPID(pid_a[1], &exit_status, 0);
++        printf(1, "\n Child# %d exited with status %d\n",ret_pid, exit_status);
++        sleep(3);
++        printf(1, "\n This is the parent: Waiting for child with PID# %d\n",pid_a[2]);
++        ret_pid = waitPID(pid_a[2], &exit_status, 0);
++        printf(1, "\n Child# %d exited with status %d\n",ret_pid, exit_status);
++        sleep(3);
++        printf(1, "\n This is the parent: Waiting for child with PID# %d\n",pid_a[0]);
++        ret_pid = waitPID(pid_a[0], &exit_status, 0);
++        printf(1, "\n Child# %d exited with status %d\n",ret_pid, exit_status);	
++
++	return 0;
++}
++	
++
+diff --git a/user.h b/user.h
+index 4f99c52..7825604 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,9 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++void exitS(int);
++int waitS(int);
++int waitPID(int, int*, int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..959d3ac 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,6 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(exitS)
++SYSCALL(waitS)
++SYSCALL(waitPID)
